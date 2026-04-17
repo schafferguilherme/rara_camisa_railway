@@ -59,6 +59,7 @@ PAGE_TIMEOUT_MS = int(os.getenv("PAGE_TIMEOUT_MS", "60000"))
 WAIT_NETWORK_IDLE_MS = int(os.getenv("WAIT_NETWORK_IDLE_MS", "10000"))
 SCROLL_COUNT = int(os.getenv("SCROLL_COUNT", "3"))
 SCROLL_WAIT_MS = int(os.getenv("SCROLL_WAIT_MS", "1200"))
+MAX_LOG_ITEMS = int(os.getenv("MAX_LOG_ITEMS", "10"))
 
 BROWSER_ARGS = [
     "--no-sandbox",
@@ -68,12 +69,16 @@ BROWSER_ARGS = [
 ]
 
 
+def log(msg: str):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
 def load_previous_state():
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
-            print("Aviso: arquivo de estado corrompido. Criando um novo.")
+            log("Aviso: arquivo de estado corrompido. Criando um novo.")
     return {"items": {}, "last_run": None}
 
 
@@ -159,8 +164,10 @@ def send_telegram_for_new_items(new_items):
         return
 
     if not ENVIAR_MENSAGEM_TELEGRAM:
-        print("Envio para o Telegram está desativado.")
+        log("Envio para o Telegram está desativado.")
         return
+
+    log(f"Enviando {len(new_items)} item(ns) novos para o Telegram...")
 
     for i, item in enumerate(new_items, start=1):
         search_label = escape_html(item["search_label"])
@@ -177,19 +184,21 @@ def send_telegram_for_new_items(new_items):
         )
 
         send_telegram_message(text)
-        print(f"Mensagem enviada ao Telegram para o item {i}/{len(new_items)}.")
+
+        if i <= 3 or i == len(new_items):
+            log(f"Telegram: item {i}/{len(new_items)} enviado.")
+        elif i == 4:
+            log("Telegram: suprimindo logs intermediários de envio...")
 
 
 def scrape_single_url(page, search_url: str):
     search_label = get_search_label(search_url)
 
-    print(f"Abrindo página: {search_label}")
     page.goto(search_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
 
     for label in ["entendi e concordo", "aceitar", "continuar", "ok"]:
         try:
             page.get_by_text(label, exact=False).click(timeout=1500)
-            print(f"Banner clicado: {label}")
             break
         except Exception:
             pass
@@ -197,13 +206,11 @@ def scrape_single_url(page, search_url: str):
     try:
         page.wait_for_load_state("networkidle", timeout=WAIT_NETWORK_IDLE_MS)
     except PlaywrightTimeoutError:
-        print("Aviso: networkidle demorou, seguindo assim mesmo.")
+        pass
 
-    print(f"Rolando a página para carregar mais itens em: {search_label}")
-    for i in range(SCROLL_COUNT):
+    for _ in range(SCROLL_COUNT):
         page.mouse.wheel(0, 2500)
         page.wait_for_timeout(SCROLL_WAIT_MS)
-        print(f"Rolagem {i + 1}/{SCROLL_COUNT} concluída.")
 
     raw = page.evaluate(
         """
@@ -374,34 +381,35 @@ def scrape_single_url(page, search_url: str):
         "kept_count": len(raw_items),
         "skipped_shop_count": len(skipped_items),
         "shop_sections_found": shop_sections_found,
-        "skipped_examples": skipped_items[:5],
     }
 
     return items, audit
 
 
 def print_audit(audit):
-    print("=" * 70)
-    print(f"COLETA - {audit['search_label']}")
-    print("=" * 70)
-    print(f"URL: {audit['search_url']}")
-    print(
-        f"Total de links de produto encontrados no DOM: {audit['total_product_links_found']}"
+    log(
+        f"Busca '{audit['search_label']}': "
+        f"links_dom={audit['total_product_links_found']} | "
+        f"lojinhas={audit['shop_sections_found']} | "
+        f"mantidos={audit['kept_count']} | "
+        f"ignorados_lojinha={audit['skipped_shop_count']}"
     )
-    print(f"Blocos de lojinha encontrados: {audit.get('shop_sections_found', 0)}")
-    print(f"Itens válidos mantidos: {audit['kept_count']}")
-    print(f"Itens ignorados por serem de lojinha: {audit['skipped_shop_count']}")
-    print()
 
-    examples = audit.get("skipped_examples", [])
-    if examples:
-        print("Exemplos de itens ignorados:")
-        for i, item in enumerate(examples, start=1):
-            href = normalize_url(item.get("href", ""))
-            text = clean_text(item.get("text", ""))[:120]
-            print(f"  [{i}] {href}")
-            print(f"      Texto: {text}")
-        print()
+
+def print_item_preview(title, items, price_key="price"):
+    if not items:
+        return
+
+    log(f"{title}: total={len(items)}. Exibindo até {MAX_LOG_ITEMS}.")
+    for i, item in enumerate(items[:MAX_LOG_ITEMS], start=1):
+        price = item.get(price_key) or "não identificado"
+        log(
+            f"[{i}] {item['search_label']} | {item['title']} | "
+            f"Preço: {price} | URL: {item['url']}"
+        )
+
+    if len(items) > MAX_LOG_ITEMS:
+        log(f"... e mais {len(items) - MAX_LOG_ITEMS} item(ns) não exibidos.")
 
 
 def main():
@@ -413,11 +421,11 @@ def main():
     all_current_items = {}
     all_removed_items = []
 
-    print(f"Arquivo de estado: {STATE_FILE}")
-    print(f"Headless: {HEADLESS}")
-    print(f"Envio Telegram: {ENVIAR_MENSAGEM_TELEGRAM}")
-    print(f"Total de buscas configuradas: {len(URLS)}")
-    print()
+    log(f"Arquivo de estado: {STATE_FILE}")
+    log(f"Headless: {HEADLESS}")
+    log(f"Envio Telegram: {ENVIAR_MENSAGEM_TELEGRAM}")
+    log(f"Total de buscas configuradas: {len(URLS)}")
+    log(f"Última execução salva anteriormente: {previous.get('last_run')}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -426,17 +434,15 @@ def main():
         )
         page = browser.new_page(viewport={"width": 1600, "height": 2200})
 
-        for search_url in URLS:
+        for idx, search_url in enumerate(URLS, start=1):
+            search_label = get_search_label(search_url)
             try:
+                log(f"Iniciando busca {idx}/{len(URLS)}: {search_label}")
                 current_items, audit = scrape_single_url(page, search_url)
                 print_audit(audit)
                 all_current_items.update(current_items)
             except Exception as e:
-                print("=" * 70)
-                print(f"ERRO NA BUSCA: {search_url}")
-                print("=" * 70)
-                print(e)
-                print()
+                log(f"ERRO NA BUSCA {idx}/{len(URLS)} - {search_label}: {e}")
 
         browser.close()
 
@@ -449,47 +455,25 @@ def main():
     all_new_items = [all_current_items[k] for k in sorted(new_keys)]
     all_removed_items = [previous_items[k] for k in sorted(removed_keys)]
 
-    print("=" * 70)
-    print("MONITOR ENJOEI - RESULTADO GERAL")
-    print("=" * 70)
-    print(f"Última execução salva: {previous.get('last_run')}")
-    print(f"Total de buscas analisadas: {len(URLS)}")
-    print(f"Itens atuais válidos encontrados: {len(all_current_items)}")
-    print(f"Itens novos desde a última execução: {len(all_new_items)}")
-    print(f"Itens que sumiram desde a última execução: {len(all_removed_items)}")
-    print()
+    log("MONITOR ENJOEI - RESULTADO GERAL")
+    log(f"Itens atuais válidos encontrados: {len(all_current_items)}")
+    log(f"Itens novos desde a última execução: {len(all_new_items)}")
+    log(f"Itens que sumiram desde a última execução: {len(all_removed_items)}")
+
+    print_item_preview("Novos itens", all_new_items)
+    print_item_preview("Itens removidos", all_removed_items)
 
     if all_new_items:
-        print("NOVOS ITENS:")
-        for i, item in enumerate(all_new_items, start=1):
-            print(f"[{i}] {item['search_label']} - {item['title']}")
-            print(f"    Preço: {item['price'] or 'não identificado'}")
-            print(f"    URL:   {item['url']}")
-            print(f"    ID:    {item['id']}")
-            print()
-
         try:
             send_telegram_for_new_items(all_new_items)
         except Exception as e:
-            print(f"Erro ao enviar mensagem no Telegram: {e}")
-            print("Os itens foram detectados, mas a mensagem não foi enviada.")
+            log(f"Erro ao enviar mensagem no Telegram: {e}")
+            log("Os itens foram detectados, mas a mensagem não foi enviada.")
     else:
-        print("Nenhum item novo encontrado.")
-        print()
-
-    if all_removed_items:
-        print("ITENS QUE SUMIRAM DESDE A ÚLTIMA EXECUÇÃO:")
-        for i, item in enumerate(all_removed_items[:20], start=1):
-            print(f"[{i}] {item['search_label']} - {item['title']}")
-            print(f"    Preço: {item.get('price') or 'não identificado'}")
-            print(f"    URL:   {item['url']}")
-            print()
-        if len(all_removed_items) > 20:
-            print(f"... e mais {len(all_removed_items) - 20} itens.")
-            print()
+        log("Nenhum item novo encontrado.")
 
     save_state(all_current_items)
-    print(f"Estado atualizado com sucesso em: {STATE_FILE}")
+    log(f"Estado atualizado com sucesso em: {STATE_FILE}")
 
 
 if __name__ == "__main__":
